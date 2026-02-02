@@ -3,9 +3,13 @@ name: Render Spirograma Fisiologia Respiratória
 on:
   workflow_dispatch:
 
+concurrency:
+  group: spirograma-render
+  cancel-in-progress: true
+
 jobs:
   render:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
 
     steps:
       - name: Checkout repository
@@ -26,17 +30,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install numpy matplotlib imageio[ffmpeg]
 
-      - name: Run render script (headless)
+      - name: Run render
         env:
           MPLBACKEND: Agg
         run: |
           python render.py
-          echo "Rendered files:"
           ls -lh
 
-      - name: Upload video artifact
+      - name: Upload video
         uses: actions/upload-artifact@v4
         with:
-          name: SPIROGRAMA_FISIOLOGIA_RESPIRATORIA_VIDEO
+          name: SPIROGRAMA_FISIOLOGIA_VIDEO
           path: "*.mp4"
-          if-no-files-found: error
