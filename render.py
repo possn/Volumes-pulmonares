@@ -8,48 +8,44 @@ import imageio.v2 as imageio
 # ============================================================
 # OUTPUT
 # ============================================================
-OUT = "Spirograma_Dinamico_Tidal_Manobras_Forcadas_FIX.mp4"
+OUT = "Spirograma_Dinamico_Tidal_Manobras_Forcadas_AULA_LIMPA.mp4"
 
 # ============================================================
 # VIDEO SETTINGS
 # ============================================================
 FPS = 20
 DURATION_S = 60
-
 W, H = 12.8, 7.2
-DPI = 100  # 12.8*100 x 7.2*100 => 1280x720
+DPI = 100  # 1280x720
 
 # ============================================================
 # DIDACTIC VOLUMES (mL) — coerentes por construção
 # ============================================================
-TLC = 6000.0   # Capacidade Pulmonar Total (CPT)
-RV  = 1200.0   # Volume Residual (VR)
-ERV = 1100.0   # Volume de Reserva Expiratório (VRE)
-VT  = 500.0    # Volume Corrente (VT)
+TLC = 6000.0   # CPT (TLC)
+RV  = 1200.0   # VR (RV)
+ERV = 1100.0   # VRE (ERV)
+VT  = 500.0    # VT (VT)
 
-FRC = RV + ERV                         # CRF = VR + VRE
-IRV = TLC - (FRC + VT)                 # VRI coerente (do fim insp tranquila até TLC)
-IC  = TLC - FRC                        # Capacidade Inspiratória (CI)
-VC  = TLC - RV                         # Capacidade Vital (CV)
+FRC = RV + ERV                 # CRF (FRC)
+IRV = TLC - (FRC + VT)         # VRI (IRV) coerente
+IC  = TLC - FRC                # CI (IC)
+VC  = TLC - RV                 # CV (VC)
 
-# Guardas de coerência (sem crash agressivo; só “clip” se algo estiver impossível)
-if IRV < 0:
-    IRV = 0.0
+IRV = max(IRV, 0.0)
 
 # ============================================================
-# TIMING (s) — ciclo didáctico estável (sem scroll)
+# TIMING (s) — ciclo fixo 30 s (repete 2x em 60 s)
 # ============================================================
-T_TIDAL_1 = 12.0   # respiração tranquila
+T_TIDAL_1 = 12.0
 T_HOLD_1  = 1.0
-T_FEXP    = 6.0    # expiração forçada até RV (rápida no início, depois abranda)
+T_FEXP    = 6.0
 T_HOLD_2  = 1.0
-T_FINS    = 6.0    # inspiração forçada até TLC
+T_FINS    = 6.0
 T_HOLD_3  = 1.0
-T_TIDAL_2 = 3.0    # retoma tranquila (curto) antes de reiniciar
+T_TIDAL_2 = 3.0
 
-T_CYCLE = T_TIDAL_1 + T_HOLD_1 + T_FEXP + T_HOLD_2 + T_FINS + T_HOLD_3 + T_TIDAL_2
+T_CYCLE = T_TIDAL_1 + T_HOLD_1 + T_FEXP + T_HOLD_2 + T_FINS + T_HOLD_3 + T_TIDAL_2  # 30s
 
-# Targets das manobras
 FEXP_TARGET = RV
 FINS_TARGET = TLC
 
@@ -58,12 +54,9 @@ def smoothstep(x: float) -> float:
     return 0.5 - 0.5*np.cos(np.pi*x)
 
 def ease_out_fast_then_slow(x: float) -> float:
-    """
-    Curva com queda/subida rápida inicial e desaceleração no fim.
-    Mantém 0..1, mais 'fisiológica' para manobras forçadas.
-    """
+    # rápido no início, abranda no fim
     x = np.clip(x, 0.0, 1.0)
-    return 1.0 - (1.0 - x)**2  # quadrática ease-out
+    return 1.0 - (1.0 - x)**2
 
 def phase_in_cycle(tau):
     a = T_TIDAL_1
@@ -88,27 +81,20 @@ def phase_in_cycle(tau):
 
 def tidal_volume(xlocal: float, breaths: float) -> float:
     """
-    Respiração tranquila "clássica" no spirograma:
-    começa na CRF, sobe até CRF+VT, volta à CRF.
-    Usa meia-coseno (não passa abaixo da CRF).
+    VT correcto: vai de CRF -> CRF+VT -> CRF (não desce para VRE).
     """
-    # 0..1 -> breaths ciclos
     theta = 2.0 * np.pi * breaths * xlocal
     return FRC + (VT / 2.0) * (1.0 - np.cos(theta))  # [FRC .. FRC+VT]
 
 def volume_of_tau(tau: float) -> float:
     ph, x = phase_in_cycle(tau)
 
-    # Tidal 1: ~3 ciclos em 12 s (15/min)
     if ph == "tidal1":
         return tidal_volume(x, breaths=3.0)
 
-    # Hold 1: fim da expiração tranquila (CRF)
     if ph == "hold1":
-        # termina em CRF (no fim de ciclos inteiros, volta a CRF)
         return FRC
 
-    # Forced expiration: parte do fim da inspiração tranquila (CRF+VT)
     if ph == "fexp":
         v0 = FRC + VT
         k = ease_out_fast_then_slow(x)
@@ -117,7 +103,6 @@ def volume_of_tau(tau: float) -> float:
     if ph == "hold2":
         return FEXP_TARGET
 
-    # Forced inspiration: do RV até TLC
     if ph == "fins":
         v0 = FEXP_TARGET
         k = ease_out_fast_then_slow(x)
@@ -126,25 +111,33 @@ def volume_of_tau(tau: float) -> float:
     if ph == "hold3":
         return FINS_TARGET
 
-    # Tidal 2 (curto): 1 ciclo para regressar à CRF e reiniciar
     if ph == "tidal2":
-        # começa em TLC; queremos cair para CRF e depois fazer 1 ciclo pequeno CRF->CRF+VT->CRF.
-        # Fazemos um “retorno” rápido a CRF na primeira metade, depois 1 ciclo.
+        # 1ª metade: volta de TLC -> CRF
         if x < 0.5:
             k = ease_out_fast_then_slow(x / 0.5)
             return TLC + (FRC - TLC) * k
-        else:
-            xx = (x - 0.5) / 0.5
-            return tidal_volume(xx, breaths=1.0)
+        # 2ª metade: 1 tidal
+        xx = (x - 0.5) / 0.5
+        return tidal_volume(xx, breaths=1.0)
 
     return FRC
 
 # ============================================================
-# Precompute one-cycle curve (for stable plot)
+# Precompute cycle curve
 # ============================================================
-N_CURVE = 2000
+N_CURVE = 2400
 t_curve = np.linspace(0.0, T_CYCLE, N_CURVE)
 v_curve = np.array([volume_of_tau(tt) for tt in t_curve])
+
+PHASE_LABEL = {
+    "tidal1": "Respiração tranquila (VT)",
+    "hold1":  "Pausa em CRF",
+    "fexp":   "Expiração forçada até VR",
+    "hold2":  "Pausa em VR",
+    "fins":   "Inspiração forçada até CPT",
+    "hold3":  "Pausa em CPT",
+    "tidal2": "Retorno a CRF + retoma VT",
+}
 
 # ============================================================
 # Render helpers
@@ -154,34 +147,36 @@ def canvas_to_rgb(fig):
     return np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
 
 # ============================================================
+# STYLE HELPERS
+# ============================================================
+def label_box(ax, x, y, text, ha="left", va="center", fs=11, weight="bold", alpha=0.92):
+    ax.text(
+        x, y, text,
+        ha=ha, va=va, fontsize=fs, weight=weight, color="#111827",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#e5e7eb", alpha=alpha),
+        zorder=20
+    )
+
+# ============================================================
 # FIGURE + VIDEO WRITER
 # ============================================================
 fig = plt.figure(figsize=(W, H), dpi=DPI)
-
 writer = imageio.get_writer(
     OUT,
     fps=FPS,
     codec="libx264",
     macro_block_size=1,
-    ffmpeg_params=[
-        "-preset", "ultrafast",
-        "-crf", "24",
-        "-r", str(FPS),          # força FPS real
-        "-pix_fmt", "yuv420p"    # compatibilidade (iPhone/Keynote/etc.)
-    ]
+    ffmpeg_params=["-preset", "ultrafast", "-crf", "24", "-pix_fmt", "yuv420p"]
 )
 
 total_frames = int(DURATION_S * FPS)
 
-# Layout constants (para evitar sobreposições)
-LABEL_FS = 10
-TITLE_FS = 13
-
 for i in range(total_frames):
     t = i / FPS
     tau = t % T_CYCLE
+    ph, _ = phase_in_cycle(tau)
 
-    # progresso: até tau (num ciclo)
+    # progresso até tau
     mask = t_curve <= tau
     t_prog = t_curve[mask]
     v_prog = v_curve[mask]
@@ -190,88 +185,124 @@ for i in range(total_frames):
     fig.clf()
     ax = fig.add_subplot(1, 1, 1)
 
-    # Zonas de fundo (correctas)
-    ax.axhspan(0, RV, facecolor="#f5e6b8", alpha=0.78)             # VR
-    ax.axhspan(RV, FRC, facecolor="#edd9a2", alpha=0.78)           # VRE (ERV)
-    ax.axhspan(FRC, FRC + VT, facecolor="#efe3c3", alpha=0.62)     # VT
-    ax.axhspan(FRC + VT, TLC, facecolor="#f1e7cc", alpha=0.48)     # VRI (IRV)
+    # =========================
+    # BACKGROUND BANDS (claras e correctas)
+    # =========================
+    ax.axhspan(0, RV, facecolor="#f1d9a6", alpha=0.75)                   # VR
+    ax.axhspan(RV, FRC, facecolor="#edd09a", alpha=0.70)                 # VRE
+    ax.axhspan(FRC, FRC + VT, facecolor="#f2e6c8", alpha=0.65)           # VT
+    ax.axhspan(FRC + VT, TLC, facecolor="#f6f0df", alpha=0.85)           # VRI
 
-    # Curva completa (referência) e progresso (realce)
-    ax.plot(t_curve, v_curve, lw=2.2, color="#6b7280", alpha=0.35)
-    ax.plot(t_prog, v_prog, lw=3.4, color="#d4382c")
-
-    # Ponto actual
+    # =========================
+    # CURVA (ref cinza + progresso vermelho)
+    # =========================
+    ax.plot(t_curve, v_curve, lw=2.2, color="#9ca3af", alpha=0.40, zorder=2)
+    ax.plot(t_prog, v_prog, lw=3.6, color="#d4382c", zorder=4)
     ax.scatter([tau], [v_now], s=85, color="#2563eb", zorder=6)
 
-    # Eixos fixos e limpos
+    # =========================
+    # AXES / GRID
+    # =========================
     ax.set_xlim(0, T_CYCLE)
     ax.set_ylim(0, TLC)
     ax.set_yticks(np.arange(0, TLC + 1, 1000))
-    ax.set_ylabel("Volume pulmonar (mL)", fontsize=12, weight="bold")
-    ax.set_xlabel("Tempo (s)", fontsize=12, weight="bold")
-    ax.grid(True, alpha=0.14)
+    ax.set_ylabel("Volume pulmonar (mL)", fontsize=13, weight="bold")
+    ax.set_xlabel("Tempo (s)", fontsize=13, weight="bold")
+    ax.grid(True, alpha=0.15)
 
-    ax.set_title("Spirograma dinâmico (tidal + manobras forçadas) — loop didáctico",
-                 fontsize=TITLE_FS, weight="bold", pad=10)
+    ax.set_title(
+        "Spirograma dinâmico (tidal + manobras forçadas) — loop didáctico",
+        fontsize=15, weight="bold", pad=12
+    )
 
-    # Linhas de referência principais
-    ax.axhline(RV,  color="#111827", lw=2.2)                        # topo do VR
-    ax.axhline(FRC, color="#111827", lw=1.8, ls="--", alpha=0.75)   # CRF
-    ax.axhline(FRC + VT, color="#111827", lw=1.2, ls=":", alpha=0.75)  # topo do VT (fim insp tranquila)
-    ax.axhline(TLC, color="#111827", lw=2.2)                        # TLC
+    # =========================
+    # LINHAS DE REFERÊNCIA (CRF tem de saltar à vista)
+    # =========================
+    ax.axhline(RV, color="#111827", lw=2.2, zorder=3)
+    ax.axhline(FRC, color="#111827", lw=2.6, ls="--", alpha=0.85, zorder=3)
+    ax.axhline(FRC + VT, color="#111827", lw=1.6, ls=":", alpha=0.70, zorder=3)
+    ax.axhline(TLC, color="#111827", lw=2.2, zorder=3)
 
-    # Labels fixos (sem colisões)
-    ax.text(0.35, TLC - 140, "CPT (TLC) — Capacidade pulmonar total",
-            fontsize=LABEL_FS, color="#111827", weight="bold")
+    # =========================
+    # RÓTULOS PRINCIPAIS (sem poluição)
+    # =========================
+    # VR bem evidente na faixa inferior
+    label_box(ax, 0.6, RV * 0.45, "VR (RV)\nVolume residual", fs=12)
 
-    ax.text(0.35, RV + 90, "VR (RV) — Volume residual",
-            fontsize=LABEL_FS, color="#111827", weight="bold")
+    # VRE no meio (RV->CRF)
+    label_box(ax, 0.6, RV + (FRC - RV) * 0.55, "VRE (ERV)\nReserva expiratória", fs=12)
 
-    ax.text(0.35, FRC + 70, "CRF (FRC) = VR + VRE",
-            fontsize=LABEL_FS, color="#111827", weight="bold")
+    # CRF como âncora (seta para a linha tracejada)
+    ax.annotate(
+        "CRF (FRC) = VR + VRE",
+        xy=(2.5, FRC),
+        xytext=(0.7, FRC + 260),
+        fontsize=12, weight="bold", color="#111827",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor="#e5e7eb", alpha=0.92),
+        arrowprops=dict(arrowstyle="->", lw=2.0, color="#111827"),
+        zorder=20
+    )
 
-    # Setas de volumes (esquerda/médio)
-    x_erv = 4.0
-    ax.annotate("", xy=(x_erv, FRC), xytext=(x_erv, RV),
-                arrowprops=dict(arrowstyle="<->", lw=2.2, color="#111827"))
-    ax.text(x_erv + 0.5, (RV + FRC) / 2.0, "VRE (ERV)\nreserva expiratória",
-            fontsize=LABEL_FS, va="center", color="#111827")
-
-    x_vt = 7.0
+    # VT (CRF -> CRF+VT)
+    x_vt = 8.0
     ax.annotate("", xy=(x_vt, FRC + VT), xytext=(x_vt, FRC),
                 arrowprops=dict(arrowstyle="<->", lw=2.2, color="#111827"))
-    ax.text(x_vt + 0.5, FRC + VT/2.0, "VT\narespiração tranquila",
-            fontsize=LABEL_FS, va="center", color="#111827")
+    label_box(ax, x_vt + 0.4, FRC + VT/2, "VT\nRespiração tranquila", fs=11)
 
-    x_irv = 10.0
+    # VRI (CRF+VT -> TLC)
+    x_irv = 11.2
     ax.annotate("", xy=(x_irv, TLC), xytext=(x_irv, FRC + VT),
                 arrowprops=dict(arrowstyle="<->", lw=2.2, color="#111827"))
-    ax.text(x_irv + 0.5, (TLC + (FRC + VT)) / 2.0, "VRI (IRV)\nreserva inspiratória",
-            fontsize=LABEL_FS, va="center", color="#111827")
+    label_box(ax, x_irv + 0.4, (TLC + (FRC + VT)) / 2, "VRI (IRV)\nReserva inspiratória", fs=11)
 
-    # Capacidades à direita (bem espaçadas)
-    xr = T_CYCLE - 1.3
+    # CPT label no topo (limpo)
+    label_box(ax, 0.6, TLC - 140, "CPT (TLC)\nCapacidade pulmonar total", fs=12)
+
+    # =========================
+    # CAPACIDADES À DIREITA (separadas, claras, sem colisões)
+    # =========================
+    xr = T_CYCLE - 1.7
+
+    # CI: FRC -> TLC
     ax.annotate("", xy=(xr, TLC), xytext=(xr, FRC),
-                arrowprops=dict(arrowstyle="<->", lw=2.2, color="#111827"))
-    ax.text(xr + 0.35, (FRC + TLC) / 2.0, "CI (IC)\ncapacidade inspiratória",
-            fontsize=LABEL_FS, va="center", color="#111827")
+                arrowprops=dict(arrowstyle="<->", lw=2.4, color="#111827"))
+    ax.text(xr + 0.35, (FRC + TLC) / 2,
+            "CI (IC)\ncapacidade\ninspiratória",
+            fontsize=11, va="center", color="#111827",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="white", edgecolor="#e5e7eb", alpha=0.92),
+            zorder=20)
 
-    xr2 = xr + 0.7
+    # CV: RV -> TLC (um pouco mais à direita)
+    xr2 = xr + 0.6
     ax.annotate("", xy=(xr2, TLC), xytext=(xr2, RV),
-                arrowprops=dict(arrowstyle="<->", lw=2.2, color="#111827"))
-    ax.text(xr2 + 0.35, (RV + TLC) / 2.0, "CV (VC)\ncapacidade vital",
-            fontsize=LABEL_FS, va="center", color="#111827")
+                arrowprops=dict(arrowstyle="<->", lw=2.4, color="#111827"))
+    ax.text(xr2 + 0.35, (RV + TLC) / 2,
+            "CV (VC)\ncapacidade\nvital",
+            fontsize=11, va="center", color="#111827",
+            bbox=dict(boxstyle="round,pad=0.22", facecolor="white", edgecolor="#e5e7eb", alpha=0.92),
+            zorder=20)
 
-    xr3 = xr2 + 0.7
+    # CPT: 0 -> TLC (mais à direita ainda, só a seta + rótulo curto)
+    xr3 = xr2 + 0.6
     ax.annotate("", xy=(xr3, TLC), xytext=(xr3, 0),
-                arrowprops=dict(arrowstyle="<->", lw=2.2, color="#111827"))
-    ax.text(xr3 + 0.35, TLC / 2.0, "CPT (TLC)",
-            fontsize=LABEL_FS, va="center", color="#111827")
+                arrowprops=dict(arrowstyle="<->", lw=2.4, color="#111827"))
+    ax.text(xr3 + 0.32, TLC * 0.50, "CPT\n(TLC)",
+            fontsize=11, va="center", color="#111827",
+            bbox=dict(boxstyle="round,pad=0.18", facecolor="white", edgecolor="#e5e7eb", alpha=0.92),
+            zorder=20)
 
-    # Legenda curta (sem “estragar” layout)
-    ax.text(0.35, 120,
-            "Correções: VR abaixo de VRE; CRF = VR + VRE; VT entre CRF e CRF+VT.",
-            fontsize=10, color="#111827", alpha=0.92)
+    # =========================
+    # BADGE DE FASE (top-left)
+    # =========================
+    ax.text(
+        0.02, 0.98,
+        f"Fase: {PHASE_LABEL.get(ph, ph)}",
+        transform=ax.transAxes,
+        ha="left", va="top",
+        fontsize=12.5, weight="bold", color="#111827",
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", edgecolor="#e5e7eb", alpha=0.95),
+        zorder=30
+    )
 
     fig.tight_layout()
     writer.append_data(canvas_to_rgb(fig))
